@@ -1,0 +1,351 @@
+# CI for the LEDE 17.01 source tree.
+#
+# Every device under conf/.config.<name> is built on its own runner. The
+# tools/ and toolchain/ stages are shared: they depend on a handful of
+# .config symbols only, so they are built once per toolchain group instead
+# of once per device and handed over through the Actions cache.
+#
+#   generate-matrix      one entry per device plus one per toolchain group
+#   repository-dispatch  notifies the downstream repository of a push
+#   toolchain            builds tools/ + toolchain/ once per group, saves cache
+#   download-sources     fills dl/ once and publishes it
+#   build-firmware       restores the toolchain cache, builds one device
+#   create-release       publishes every artifact under the version tag
+#   cleanup              keeps only the newest release
+#
+# The cache contract lives in .github/actions/: enumerate-targets produces
+# the toolchain group ids and the tree digests, setup-build-env turns a
+# group id into a cache key. Both workflows share it, so a key can never
+# drift between the job that writes it and the job that reads it.
+
+name: CI
+
+on:
+  push:
+    branches: [master]
+    # A push that only touches these never changes a firmware image.
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - 'README'
+      - '.github/issue_template'
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: 'Devices to build (conf/.config.<name> suffixes, comma separated) or "all"'
+        required: false
+        default: all
+      force_toolchain:
+        description: Rebuild the toolchain even when the cache already holds it
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  repository-dispatch:
+    if: github.repository == 'HiGarfield/lede-17.01.4-Mod' && github.event_name == 'push'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@main
+
+      - name: Derive the dispatch event type
+        id: event-type
+        run: |
+          set -euo pipefail
+          commit_title=$(git log -1 --pretty=format:%s)
+          # A repository_dispatch event_type accepts letters, digits and
+          # . _ - only. Everything else (spaces, newlines, multibyte
+          # characters, punctuation) becomes '-', then runs collapse, the
+          # string is trimmed and finally cut to 100 characters.
+          event_type=$(printf '%s' "${commit_title}" | tr -c 'A-Za-z0-9._-' '-' | tr -s '-' | sed 's/^-//;s/-$//' | cut -c1-100)
+          [ -n "${event_type}" ] || event_type=lede-build
+          echo "event_type=${event_type}" >> "${GITHUB_OUTPUT}"
+
+      - name: Notify the downstream repository
+        uses: HiGarfield/repository-dispatch@main
+        with:
+          token: ${{ secrets.MY_TOKEN }}
+          repository: ${{ secrets.SECOND_REPO }}
+          event-type: ${{ steps.event-type.outputs.event_type }}
+
+  generate-matrix:
+    if: github.repository == 'HiGarfield/lede-17.01.4-Mod'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    outputs:
+      targets: ${{ steps.targets.outputs.targets }}
+      tc-groups: ${{ steps.targets.outputs.tc-groups }}
+      lede_version: ${{ steps.targets.outputs.version }}
+      tools-hash: ${{ steps.targets.outputs.tools-hash }}
+      dl-hash: ${{ steps.targets.outputs.dl-hash }}
+    steps:
+      # Full history: the toolchain key carries the last commit that touched
+      # tools/ or toolchain/, and the dl key hashes the trees that decide
+      # which sources are downloaded. Every other job checks out a single
+      # commit and receives both values as job outputs.
+      - name: Check out the repository with full history
+        uses: actions/checkout@main
+        with:
+          fetch-depth: 0
+
+      - name: Enumerate the devices and the toolchain groups
+        id: targets
+        uses: ./.github/actions/enumerate-targets
+        with:
+          source-repo: ${{ env.SOURCE_REPO }}
+          requested: ${{ inputs.targets || 'all' }}
+
+  toolchain:
+    needs: [generate-matrix]
+    if: github.repository == 'HiGarfield/lede-17.01.4-Mod'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.generate-matrix.outputs.tc-groups) }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@main
+
+      - name: Prepare the build environment
+        id: env
+        uses: ./.github/actions/setup-build-env
+        with:
+          source-repo: ${{ env.SOURCE_REPO }}
+          target: ${{ matrix.representative }}
+          group: ${{ matrix.group }}
+          tools-hash: ${{ needs.generate-matrix.outputs.tools-hash }}
+          key-suffix: ${{ inputs.force_toolchain && format('force-{0}', github.run_id) || 'v1' }}
+
+      - name: Restore the toolchain cache
+        id: restore
+        uses: actions/cache/restore@main
+        with:
+          path: |
+            ${{ steps.env.outputs.working-dir }}/staging_dir/host*
+            ${{ steps.env.outputs.working-dir }}/staging_dir/tool*
+          key: ${{ steps.env.outputs.cache-key }}
+
+      # tools/install and toolchain/install is exactly what the prepare
+      # stage of a full build would run, without touching target/ or
+      # package/. The representative device only supplies a .config that
+      # belongs to this toolchain group.
+      - name: Build the tools and the toolchain
+        if: steps.restore.outputs.cache-hit != 'true' || inputs.force_toolchain
+        working-directory: ${{ steps.env.outputs.working-dir }}
+        run: |
+          set -euo pipefail
+          cp -f "conf/.config.${{ matrix.representative }}" .config
+          make defconfig
+          make -j"$(nproc)" tools/install toolchain/install
+
+      # Only on a miss: a cache entry is immutable, so re-saving a key that
+      # already exists would fail and a hit means this exact toolchain is
+      # already stored.
+      - name: Save the toolchain cache
+        if: steps.restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@main
+        with:
+          path: |
+            ${{ steps.env.outputs.working-dir }}/staging_dir/host*
+            ${{ steps.env.outputs.working-dir }}/staging_dir/tool*
+          key: ${{ steps.env.outputs.cache-key }}
+
+  download-sources:
+    needs: [generate-matrix]
+    if: github.repository == 'HiGarfield/lede-17.01.4-Mod'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 240
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@main
+
+      - name: Prepare the build environment
+        id: env
+        uses: ./.github/actions/setup-build-env
+        with:
+          source-repo: ${{ env.SOURCE_REPO }}
+          tools-hash: ${{ needs.generate-matrix.outputs.tools-hash }}
+
+      # download_all.sh starts from clean_all.sh, which wipes dl/, so this
+      # job always downloads everything from scratch. It is the only writer
+      # of the dl cache; the device jobs only read it.
+      - name: Download every source tarball
+        working-directory: ${{ steps.env.outputs.working-dir }}
+        run: |
+          set -euo pipefail
+          ./download_all.sh
+
+      - name: Archive the source mirror
+        working-directory: ${{ steps.env.outputs.working-dir }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          # Store instead of deflate: dl/ holds compressed tarballs already.
+          zip -0 -j "out/dl-${{ needs.generate-matrix.outputs.lede_version }}.zip" dl/*
+
+      - name: Upload the source mirror
+        uses: actions/upload-artifact@main
+        with:
+          name: dl-${{ needs.generate-matrix.outputs.lede_version }}
+          path: ${{ steps.env.outputs.working-dir }}/out/*
+          retention-days: 2
+
+      # A cache entry is immutable, so saving under a key that already
+      # exists fails. Look the key up first instead of downloading the
+      # tarballs: download_all.sh wipes dl/ anyway, so the only thing this
+      # job needs to know is whether the tree digest is already stored.
+      - name: Check whether the source mirror is already cached
+        id: lookup
+        uses: actions/cache/restore@main
+        with:
+          path: ${{ steps.env.outputs.working-dir }}/dl
+          key: dl-${{ needs.generate-matrix.outputs.dl-hash }}
+          lookup-only: true
+
+      - name: Save the source mirror cache
+        if: steps.lookup.outputs.cache-hit != 'true'
+        uses: actions/cache/save@main
+        with:
+          path: ${{ steps.env.outputs.working-dir }}/dl
+          key: dl-${{ needs.generate-matrix.outputs.dl-hash }}
+
+  build-firmware:
+    needs: [generate-matrix, toolchain]
+    if: github.repository == 'HiGarfield/lede-17.01.4-Mod'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.generate-matrix.outputs.targets) }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@main
+
+      - name: Prepare the build environment
+        id: env
+        uses: ./.github/actions/setup-build-env
+        with:
+          source-repo: ${{ env.SOURCE_REPO }}
+          target: ${{ matrix.target }}
+          group: ${{ matrix.group }}
+          tools-hash: ${{ needs.generate-matrix.outputs.tools-hash }}
+          key-suffix: ${{ inputs.force_toolchain && format('force-{0}', github.run_id) || 'v1' }}
+          skip-toolchain-prereqs: 'true'
+
+      - name: Restore the toolchain cache
+        id: toolchain
+        uses: actions/cache/restore@main
+        with:
+          path: |
+            ${{ steps.env.outputs.working-dir }}/staging_dir/host*
+            ${{ steps.env.outputs.working-dir }}/staging_dir/tool*
+          key: ${{ steps.env.outputs.cache-key }}
+
+      # The toolchain job owns this key and the group ids come from the same
+      # action, so a miss means something is wrong (a different compiler, a
+      # changed tools/ tree, an evicted entry). Rebuilding here would hide
+      # it, and the Makefile no longer asks for the toolchain anyway.
+      - name: Verify the toolchain cache hit
+        if: steps.toolchain.outputs.cache-hit != 'true'
+        run: |
+          echo "::error::no toolchain cache entry for ${{ steps.env.outputs.cache-key }}"
+          exit 1
+
+      - name: Restore the source mirror cache
+        uses: actions/cache/restore@main
+        with:
+          path: ${{ steps.env.outputs.working-dir }}/dl
+          key: dl-${{ needs.generate-matrix.outputs.dl-hash }}
+          restore-keys: dl-
+
+      - name: Build the firmware
+        working-directory: ${{ steps.env.outputs.working-dir }}
+        run: |
+          set -euo pipefail
+          cp -f "conf/.config.${{ matrix.target }}" .config
+          make defconfig
+          # Retry in parallel. A serial "make -j1 V=s" run would redo hours
+          # of work just to print the error the parallel run already hit.
+          make -j"$(nproc)" || make -j"$(nproc)" V=s
+
+      - name: Collect the firmware images
+        working-directory: ${{ steps.env.outputs.working-dir }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          for f in bin/targets/*/*/*-factory.bin \
+                   bin/targets/*/*/*-sysupgrade.bin \
+                   bin/targets/*/*/*-initramfs-kernel.bin; do
+            [ -f "${f}" ] || continue
+            cp -u -f "${f}" out/
+          done
+          echo "Collected images:"
+          ls -1 out/
+
+      - name: Upload the firmware images
+        uses: actions/upload-artifact@main
+        with:
+          name: lede-${{ needs.generate-matrix.outputs.lede_version }}-${{ matrix.target }}
+          path: ${{ steps.env.outputs.working-dir }}/out/*
+          retention-days: 2
+
+  create-release:
+    needs: [generate-matrix, download-sources, build-firmware]
+    if: github.repository == 'HiGarfield/lede-17.01.4-Mod'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Download every artifact
+        uses: actions/download-artifact@main
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Publish the release
+        uses: HiGarfield/action-gh-release@master
+        with:
+          tag_name: ${{ needs.generate-matrix.outputs.lede_version }}
+          files: artifacts/*
+          make_latest: true
+          overwrite_files: true
+
+  # create-release keeps make_latest, so the newest release is always the
+  # current build. This job drops the older ones, which would otherwise
+  # pile up one tag per push.
+  cleanup:
+    needs: [create-release]
+    if: github.repository == 'HiGarfield/lede-17.01.4-Mod'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Delete the superseded releases
+        uses: HiGarfield/delete-release-action@master
+        continue-on-error: true
+        with:
+          release-drop: true
+          release-keep-count: 0
+          release-drop-tag: true
+          pre-release-drop: true
+          pre-release-keep-count: -1
+          pre-release-drop-tag: true
+          draft-drop: true
+          draft-drop-count: -1
+        env:
+          GITHUB_TOKEN: ${{ github.token }}

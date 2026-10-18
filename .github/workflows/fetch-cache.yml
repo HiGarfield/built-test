@@ -1,0 +1,97 @@
+# Keeps the toolchain cache entries alive.
+#
+# GitHub evicts a cache entry that has not been read for seven days. The CI
+# workflow only reads the entries a push actually needs, so between two
+# releases they can expire and the next build pays for a full toolchain
+# rebuild. This workflow reads every entry on a schedule, which resets that
+# timer.
+#
+# There is no save step on purpose: only the CI workflow publishes toolchain
+# entries, and reading one is enough to refresh it. The dl cache needs no
+# keep-alive either, it is content addressed and re-downloading it after an
+# eviction is cheaper than fetching it here on every run.
+
+name: Refresh toolchain cache
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Every five days, well inside the seven day eviction window even when
+    # a scheduled run is delayed.
+    - cron: '0 0 */5 * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+env:
+  # Same two layouts as CI.yml: the checkout is either already the source
+  # tree, or it is a bare repository carrying only .github and the source
+  # tree gets cloned from SOURCE_REPO into source/.
+  SOURCE_REPO: HiGarfield/lede-17.01.4-Mod
+
+jobs:
+  generate-matrix:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    outputs:
+      tc-groups: ${{ steps.targets.outputs.tc-groups }}
+      tools-hash: ${{ steps.targets.outputs.tools-hash }}
+    steps:
+      # Full history: the cached key carries the last commit that touched
+      # tools/ or toolchain/.
+      - name: Check out the repository with full history
+        uses: actions/checkout@main
+        with:
+          fetch-depth: 0
+
+      - name: Enumerate the devices and the toolchain groups
+        id: targets
+        uses: ./.github/actions/enumerate-targets
+        with:
+          source-repo: ${{ env.SOURCE_REPO }}
+
+  refresh-toolchain-cache:
+    needs: [generate-matrix]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.generate-matrix.outputs.tc-groups) }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@main
+
+      # Installs build-essential as well: the cache key hashes the compiler
+      # version, so this job has to end up with the same gcc as a CI build.
+      - name: Prepare the build environment
+        id: env
+        uses: ./.github/actions/setup-build-env
+        with:
+          source-repo: ${{ env.SOURCE_REPO }}
+          target: ${{ matrix.representative }}
+          group: ${{ matrix.group }}
+          tools-hash: ${{ needs.generate-matrix.outputs.tools-hash }}
+
+      # Reading the entry is the whole point of this job: it resets the
+      # eviction timer without publishing anything.
+      - name: Restore the toolchain cache
+        id: restore
+        uses: actions/cache/restore@main
+        with:
+          path: |
+            ${{ steps.env.outputs.working-dir }}/staging_dir/host*
+            ${{ steps.env.outputs.working-dir }}/staging_dir/tool*
+          key: ${{ steps.env.outputs.cache-key }}
+
+      - name: Report the refresh result
+        run: |
+          if [ "${{ steps.restore.outputs.cache-hit }}" = "true" ]; then
+            echo "refreshed ${{ steps.env.outputs.cache-key }}"
+          else
+            echo "::warning::${{ steps.env.outputs.cache-key }} is gone, the next CI run rebuilds it"
+          fi
